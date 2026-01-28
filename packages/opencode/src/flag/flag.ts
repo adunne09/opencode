@@ -28,6 +28,7 @@ export namespace Flag {
   export const OPENCODE_CLIENT = process.env["OPENCODE_CLIENT"] ?? "cli"
   export const OPENCODE_SERVER_PASSWORD = process.env["OPENCODE_SERVER_PASSWORD"]
   export const OPENCODE_SERVER_USERNAME = process.env["OPENCODE_SERVER_USERNAME"]
+  export declare const OPENCODE_TRANSCRIPTION: string | undefined
 
   // Experimental
   export const OPENCODE_EXPERIMENTAL = truthy("OPENCODE_EXPERIMENTAL")
@@ -74,6 +75,17 @@ Object.defineProperty(Flag, "OPENCODE_DISABLE_PROJECT_CONFIG", {
 Object.defineProperty(Flag, "OPENCODE_CONFIG_DIR", {
   get() {
     return process.env["OPENCODE_CONFIG_DIR"]
+  },
+  enumerable: true,
+  configurable: false,
+})
+
+// Dynamic getter for OPENCODE_TRANSCRIPTION
+// This must be evaluated at access time, not module load time,
+// because the web command can set it at runtime
+Object.defineProperty(Flag, "OPENCODE_TRANSCRIPTION", {
+  get() {
+    return process.env["OPENCODE_TRANSCRIPTION"]
   },
   enumerable: true,
   configurable: false,

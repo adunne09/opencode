@@ -124,6 +124,20 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const files = useFile()
   const prompt = usePrompt()
   const commentCount = createMemo(() => prompt.context.items().filter((item) => !!item.comment?.trim()).length)
+  const transcriptionEndpoint = createMemo(() => {
+    const endpoint = sync.data.config.transcription?.endpoint
+    if (!endpoint) return undefined
+    const trimmed = endpoint.trim()
+    if (!trimmed) return undefined
+    return trimmed
+  })
+  const transcriptionDebug = createMemo(() => {
+    if (typeof window !== "object") return false
+    const params = new URLSearchParams(window.location.search)
+    if (params.get("transcriptionDebug") === "1") return true
+    if (typeof localStorage !== "object") return false
+    return localStorage.getItem("opencode.transcription.debug") === "1"
+  })
   const layout = useLayout()
   const comments = useComments()
   const params = useParams()
@@ -240,6 +254,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     dragging: boolean
     mode: "normal" | "shell"
     applyingHistory: boolean
+    recording: boolean
+    transcribing: boolean
   }>({
     popover: null,
     historyIndex: -1,
@@ -248,6 +264,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     dragging: false,
     mode: "normal",
     applyingHistory: false,
+    recording: false,
+    transcribing: false,
+  })
+
+  const transcriptionEnabled = createMemo(() => {
+    if (!transcriptionEndpoint()) return false
+    return store.mode === "normal"
   })
 
   const MAX_HISTORY = 100
@@ -324,6 +347,491 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const [composing, setComposing] = createSignal(false)
   const isImeComposing = (event: KeyboardEvent) => event.isComposing || composing() || event.keyCode === 229
+
+  const errorText = (err: unknown) => {
+    if (err && typeof err === "object" && "data" in err) {
+      const data = (err as { data?: { message?: string } }).data
+      if (data?.message) return data.message
+    }
+    if (err instanceof Error) return err.message
+    return language.t("common.requestFailed")
+  }
+
+  const parseEndpoint = (value: string) => {
+    if (typeof URL !== "function") return undefined
+    const canParse = "canParse" in URL ? (URL as { canParse?: (input: string) => boolean }).canParse : undefined
+    if (typeof canParse === "function" && !canParse(value)) return undefined
+    const parsed = (() => {
+      try {
+        return new URL(value)
+      } catch {
+        return undefined
+      }
+    })()
+    if (!parsed) return undefined
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined
+    return parsed
+  }
+
+  const parseTranscript = (data: unknown) => {
+    if (!data || typeof data !== "object") return ""
+    if (!("text" in data)) return ""
+    const text = (data as { text?: unknown }).text
+    if (typeof text !== "string") return ""
+    return text.trim()
+  }
+
+  const logTranscriptionDebug = async (file: File) => {
+    if (!transcriptionDebug()) return
+    const head = new Uint8Array(await file.slice(0, 16).arrayBuffer())
+    const hex = Array.from(head)
+      .map((value) => value.toString(16).padStart(2, "0"))
+      .join(" ")
+    console.log("[transcription] file", {
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      head: hex,
+    })
+
+    const target = globalThis as typeof globalThis & {
+      __opencodeTranscriptionFile?: File
+      __opencodeTranscriptionDownload?: () => void
+    }
+    target.__opencodeTranscriptionFile = file
+    target.__opencodeTranscriptionDownload = () => {
+      const url = URL.createObjectURL(file)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = file.name
+      link.click()
+      URL.revokeObjectURL(url)
+    }
+    console.log("[transcription] download via window.__opencodeTranscriptionDownload()")
+  }
+
+  const waitForWorktree = async (input: { directory: string; sessionID: string }) => {
+    const worktree = WorktreeState.get(input.directory)
+    if (!worktree || worktree.status !== "pending") return true
+
+    if (input.directory === sdk.directory) {
+      sync.set("session_status", input.sessionID, { type: "busy" })
+    }
+
+    const timeoutMs = 5 * 60 * 1000
+    const timer = { id: undefined as number | undefined }
+    const timeout = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((resolve) => {
+      timer.id = window.setTimeout(() => {
+        resolve({ status: "failed", message: language.t("workspace.error.stillPreparing") })
+      }, timeoutMs)
+    })
+
+    const result = await Promise.race([WorktreeState.wait(input.directory), timeout]).finally(() => {
+      if (timer.id === undefined) return
+      clearTimeout(timer.id)
+    })
+
+    if (input.directory === sdk.directory) {
+      sync.set("session_status", input.sessionID, { type: "idle" })
+    }
+
+    if (result.status === "failed") {
+      showToast({
+        title: language.t("prompt.toast.promptSendFailed.title"),
+        description: result.message ?? language.t("common.requestFailed"),
+      })
+      return false
+    }
+
+    return true
+  }
+
+  const sendTranscribedMessage = async (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed) return
+
+    const currentModel = local.model.current()
+    const currentAgent = local.agent.current()
+    if (!currentModel || !currentAgent) {
+      showToast({
+        title: language.t("prompt.toast.modelAgentRequired.title"),
+        description: language.t("prompt.toast.modelAgentRequired.description"),
+      })
+      return
+    }
+
+    const projectDirectory = sdk.directory
+    const isNewSession = !params.id
+    const worktreeSelection = props.newSessionWorktree ?? "main"
+
+    let sessionDirectory = projectDirectory
+    let client = sdk.client
+
+    if (isNewSession) {
+      if (worktreeSelection === "create") {
+        const createdWorktree = await client.worktree
+          .create({ directory: projectDirectory })
+          .then((x) => x.data)
+          .catch((err) => {
+            showToast({
+              title: language.t("prompt.toast.worktreeCreateFailed.title"),
+              description: errorText(err),
+            })
+            return undefined
+          })
+
+        if (!createdWorktree?.directory) {
+          showToast({
+            title: language.t("prompt.toast.worktreeCreateFailed.title"),
+            description: language.t("common.requestFailed"),
+          })
+          return
+        }
+
+        WorktreeState.pending(createdWorktree.directory)
+        sessionDirectory = createdWorktree.directory
+      }
+
+      if (worktreeSelection !== "main" && worktreeSelection !== "create") {
+        sessionDirectory = worktreeSelection
+      }
+
+      if (sessionDirectory !== projectDirectory) {
+        client = createOpencodeClient({
+          baseUrl: sdk.url,
+          fetch: platform.fetch,
+          directory: sessionDirectory,
+          throwOnError: true,
+        })
+        globalSync.child(sessionDirectory)
+      }
+
+      props.onNewSessionWorktreeReset?.()
+    }
+
+    let session = info()
+    if (!session && isNewSession) {
+      session = await client.session
+        .create()
+        .then((x) => x.data ?? undefined)
+        .catch((err) => {
+          showToast({
+            title: language.t("prompt.toast.sessionCreateFailed.title"),
+            description: errorText(err),
+          })
+          return undefined
+        })
+      if (session) navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
+    }
+    if (!session) return
+
+    props.onSubmit?.()
+
+    const model = {
+      modelID: currentModel.id,
+      providerID: currentModel.provider.id,
+    }
+    const agent = currentAgent.name
+    const variant = local.model.variant.current()
+
+    const messageID = Identifier.ascending("message")
+    const textPart = {
+      id: Identifier.ascending("part"),
+      type: "text" as const,
+      text: trimmed,
+    }
+    const requestParts = [textPart]
+
+    const optimisticParts = requestParts.map((part) => ({
+      ...part,
+      sessionID: session.id,
+      messageID,
+    })) as unknown as Part[]
+
+    const optimisticMessage: Message = {
+      id: messageID,
+      sessionID: session.id,
+      role: "user",
+      time: { created: Date.now() },
+      agent,
+      model,
+    }
+
+    const addOptimisticMessage = () => {
+      if (sessionDirectory === projectDirectory) {
+        sync.set(
+          produce((draft) => {
+            const messages = draft.message[session.id]
+            if (!messages) {
+              draft.message[session.id] = [optimisticMessage]
+            } else {
+              const result = Binary.search(messages, messageID, (m) => m.id)
+              messages.splice(result.index, 0, optimisticMessage)
+            }
+            draft.part[messageID] = optimisticParts
+              .filter((p) => !!p?.id)
+              .slice()
+              .sort((a, b) => a.id.localeCompare(b.id))
+          }),
+        )
+        return
+      }
+
+      globalSync.child(sessionDirectory)[1](
+        produce((draft) => {
+          const messages = draft.message[session.id]
+          if (!messages) {
+            draft.message[session.id] = [optimisticMessage]
+          } else {
+            const result = Binary.search(messages, messageID, (m) => m.id)
+            messages.splice(result.index, 0, optimisticMessage)
+          }
+          draft.part[messageID] = optimisticParts
+            .filter((p) => !!p?.id)
+            .slice()
+            .sort((a, b) => a.id.localeCompare(b.id))
+        }),
+      )
+    }
+
+    const removeOptimisticMessage = () => {
+      if (sessionDirectory === projectDirectory) {
+        sync.set(
+          produce((draft) => {
+            const messages = draft.message[session.id]
+            if (messages) {
+              const result = Binary.search(messages, messageID, (m) => m.id)
+              if (result.found) messages.splice(result.index, 1)
+            }
+            delete draft.part[messageID]
+          }),
+        )
+        return
+      }
+
+      globalSync.child(sessionDirectory)[1](
+        produce((draft) => {
+          const messages = draft.message[session.id]
+          if (messages) {
+            const result = Binary.search(messages, messageID, (m) => m.id)
+            if (result.found) messages.splice(result.index, 1)
+          }
+          delete draft.part[messageID]
+        }),
+      )
+    }
+
+    addOptimisticMessage()
+
+    const ready = await waitForWorktree({ directory: sessionDirectory, sessionID: session.id })
+    if (!ready) {
+      removeOptimisticMessage()
+      return
+    }
+
+    await client.session
+      .prompt({
+        sessionID: session.id,
+        agent,
+        model,
+        messageID,
+        parts: requestParts,
+        variant,
+      })
+      .catch((err) => {
+        if (sessionDirectory === projectDirectory) {
+          sync.set("session_status", session.id, { type: "idle" })
+        }
+        showToast({
+          title: language.t("prompt.toast.promptSendFailed.title"),
+          description: errorText(err),
+        })
+        removeOptimisticMessage()
+      })
+  }
+
+  const transcribe = async (file: File, mime: string) => {
+    const endpoint = transcriptionEndpoint()
+    if (!endpoint) return
+
+    setStore("transcribing", true)
+
+    const parsed = parseEndpoint(endpoint)
+    if (!parsed) {
+      showToast({
+        title: language.t("prompt.toast.transcriptionInvalid.title"),
+        description: language.t("prompt.toast.transcriptionInvalid.description"),
+      })
+      setStore("transcribing", false)
+      return
+    }
+
+    const type = mime || file.type || ""
+    const form = new FormData()
+    form.append("file", file)
+    if (type) form.append("mime", type)
+
+    await logTranscriptionDebug(file)
+
+    const response = await (platform.fetch ?? fetch)(parsed.toString(), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+      },
+      body: form,
+    }).catch((err) => {
+      showToast({
+        title: language.t("prompt.toast.transcriptionFailed.title"),
+        description: errorText(err),
+      })
+      return undefined
+    })
+
+    if (!response) {
+      setStore("transcribing", false)
+      return
+    }
+
+    if (!response.ok) {
+      showToast({
+        title: language.t("prompt.toast.transcriptionFailed.title"),
+        description: `HTTP ${response.status}`,
+      })
+      setStore("transcribing", false)
+      return
+    }
+
+    const contentType = response.headers.get("content-type") ?? ""
+    const data = contentType.includes("application/json") ? await response.json().catch(() => undefined) : undefined
+    const text = parseTranscript(data)
+    if (!text) {
+      showToast({
+        title: language.t("prompt.toast.transcriptionFailed.title"),
+        description: language.t("prompt.toast.transcriptionInvalid.description"),
+      })
+      setStore("transcribing", false)
+      return
+    }
+
+    await sendTranscribedMessage(text)
+    setStore("transcribing", false)
+  }
+
+  const record = {
+    recorder: undefined as MediaRecorder | undefined,
+    stream: undefined as MediaStream | undefined,
+    chunks: [] as Blob[],
+  }
+
+  const stopStream = () => {
+    if (!record.stream) return
+    for (const track of record.stream.getTracks()) {
+      track.stop()
+    }
+    record.stream = undefined
+  }
+
+  const cancelRecord = () => {
+    const rec = record.recorder
+    if (rec) {
+      rec.ondataavailable = null
+      rec.onstop = null
+      if (rec.state !== "inactive") rec.stop()
+    }
+    record.recorder = undefined
+    record.chunks = []
+    stopStream()
+    setStore("recording", false)
+  }
+
+  onCleanup(cancelRecord)
+
+  const startRecord = async () => {
+    if (store.recording || store.transcribing) return
+    if (!transcriptionEndpoint()) return
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      showToast({
+        title: language.t("prompt.toast.transcriptionUnsupported.title"),
+        description: language.t("prompt.toast.transcriptionUnsupported.description"),
+      })
+      return
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch((err) => {
+      showToast({
+        title: language.t("prompt.toast.transcriptionUnsupported.title"),
+        description: errorText(err),
+      })
+      return undefined
+    })
+
+    if (!stream) return
+
+    const types = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4",
+      "audio/mpeg",
+      "audio/wav",
+    ]
+    const mime = types.find((item) => MediaRecorder.isTypeSupported(item))
+    const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
+    record.recorder = rec
+    record.stream = stream
+    record.chunks = []
+
+    rec.ondataavailable = (event) => {
+      if (!event.data || event.data.size === 0) return
+      record.chunks.push(event.data)
+    }
+
+    rec.onstop = () => {
+      const type = rec.mimeType || record.chunks[0]?.type || ""
+      const ext = type.includes("webm")
+        ? "webm"
+        : type.includes("ogg")
+          ? "ogg"
+          : type.includes("mp4")
+            ? "mp4"
+            : type.includes("mpeg")
+              ? "mp3"
+              : type.includes("wav")
+                ? "wav"
+                : "webm"
+      const file = new File(record.chunks, `recording.${ext}`, type ? { type } : undefined)
+      record.chunks = []
+      record.recorder = undefined
+      stopStream()
+      setStore("recording", false)
+      void transcribe(file, type)
+    }
+
+    rec.start()
+    setStore("recording", true)
+  }
+
+  const stopRecord = () => {
+    const rec = record.recorder
+    if (!rec) return
+    if (rec.state === "inactive") return
+    rec.stop()
+  }
+
+  const toggleRecord = () => {
+    if (store.recording) {
+      stopRecord()
+      return
+    }
+    void startRecord()
+  }
+
+  createEffect(() => {
+    if (!store.recording) return
+    if (transcriptionEnabled()) return
+    cancelRecord()
+  })
 
   const addImageAttachment = async (file: File) => {
     if (!ACCEPTED_FILE_TYPES.includes(file.type)) return
@@ -2007,6 +2515,44 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             />
             <div class="flex items-center gap-2">
               <SessionContextUsage />
+              <Show when={transcriptionEnabled()}>
+                <Tooltip
+                  placement="top"
+                  value={
+                    <Switch>
+                      <Match when={store.transcribing}>{language.t("prompt.action.transcribing")}</Match>
+                      <Match when={store.recording}>{language.t("prompt.action.stopRecording")}</Match>
+                      <Match when={true}>{language.t("prompt.action.record")}</Match>
+                    </Switch>
+                  }
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    class="size-6"
+                    onClick={toggleRecord}
+                    disabled={store.transcribing}
+                    aria-label={
+                      store.transcribing
+                        ? language.t("prompt.action.transcribing")
+                        : store.recording
+                          ? language.t("prompt.action.stopRecording")
+                          : language.t("prompt.action.record")
+                    }
+                    aria-pressed={store.recording}
+                  >
+                    <Icon
+                      name={store.transcribing ? "dot-grid" : store.recording ? "stop" : "mic"}
+                      classList={{
+                        "size-4.5": true,
+                        "animate-pulse": store.recording || store.transcribing,
+                        "text-icon-critical-base": store.recording,
+                        "text-icon-base": !store.recording,
+                      }}
+                    />
+                  </Button>
+                </Tooltip>
+              </Show>
               <Show when={store.mode === "normal"}>
                 <Tooltip placement="top" value={language.t("prompt.action.attachFile")}>
                   <Button

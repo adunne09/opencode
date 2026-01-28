@@ -30,9 +30,17 @@ function getNetworkIPs() {
 
 export const WebCommand = cmd({
   command: "web",
-  builder: (yargs) => withNetworkOptions(yargs),
+  builder: (yargs) =>
+    withNetworkOptions(yargs).option("transcription", {
+      type: "string",
+      describe: "transcription endpoint for web recording",
+    }),
   describe: "start opencode server and open web interface",
   handler: async (args) => {
+    const transcription = typeof args.transcription === "string" ? args.transcription.trim() : undefined
+    if (transcription) {
+      process.env["OPENCODE_TRANSCRIPTION"] = transcription
+    }
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
       UI.println(UI.Style.TEXT_WARNING_BOLD + "!  " + "OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }

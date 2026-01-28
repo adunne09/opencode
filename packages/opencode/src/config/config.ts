@@ -162,6 +162,18 @@ export namespace Config {
       result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
     }
 
+    const transcription = Flag.OPENCODE_TRANSCRIPTION?.trim()
+    if (transcription) {
+      const parsed = Transcription.safeParse({ endpoint: transcription })
+      if (!parsed.success) {
+        throw new InvalidError({
+          path: "flag:OPENCODE_TRANSCRIPTION",
+          issues: parsed.error.issues,
+        })
+      }
+      result.transcription = parsed.data
+    }
+
     // Backwards compatibility: legacy top-level `tools` config
     if (result.tools) {
       const perms: Record<string, Config.PermissionAction> = {}
@@ -824,6 +836,22 @@ export namespace Config {
       ref: "ServerConfig",
     })
 
+  export const Transcription = z
+    .object({
+      endpoint: z
+        .string()
+        .url()
+        .describe("URL of a transcription endpoint that accepts audio uploads and returns JSON { text }")
+        .refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
+          message: "Transcription endpoint must use http or https",
+        }),
+    })
+    .strict()
+    .meta({
+      ref: "TranscriptionConfig",
+    })
+  export type Transcription = z.infer<typeof Transcription>
+
   export const Layout = z.enum(["auto", "stretch"]).meta({
     ref: "LayoutConfig",
   })
@@ -890,6 +918,7 @@ export namespace Config {
       logLevel: Log.Level.optional().describe("Log level"),
       tui: TUI.optional().describe("TUI specific settings"),
       server: Server.optional().describe("Server configuration for opencode serve and web commands"),
+      transcription: Transcription.optional().describe("Transcription backend configuration"),
       command: z
         .record(z.string(), Command)
         .optional()

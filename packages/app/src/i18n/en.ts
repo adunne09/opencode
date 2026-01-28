@@ -224,6 +224,9 @@ export const dict = {
   "prompt.attachment.remove": "Remove attachment",
   "prompt.action.send": "Send",
   "prompt.action.stop": "Stop",
+  "prompt.action.record": "Record",
+  "prompt.action.stopRecording": "Stop recording",
+  "prompt.action.transcribing": "Transcribing",
 
   "prompt.toast.pasteUnsupported.title": "Unsupported paste",
   "prompt.toast.pasteUnsupported.description": "Only images or PDFs can be pasted here.",
@@ -234,6 +237,13 @@ export const dict = {
   "prompt.toast.shellSendFailed.title": "Failed to send shell command",
   "prompt.toast.commandSendFailed.title": "Failed to send command",
   "prompt.toast.promptSendFailed.title": "Failed to send prompt",
+  "prompt.toast.transcriptionUnsupported.title": "Microphone unavailable",
+  "prompt.toast.transcriptionUnsupported.description": "Check your browser permissions and microphone support.",
+  "prompt.toast.transcriptionInvalid.title": "Invalid transcription endpoint",
+  "prompt.toast.transcriptionInvalid.description":
+    "Endpoint must be an http(s) URL that accepts audio and returns JSON { text }.",
+  "prompt.toast.transcriptionFailed.title": "Transcription failed",
+  "prompt.toast.transcriptionFailed.description": "The transcription endpoint did not return text.",
 
   "dialog.mcp.title": "MCPs",
   "dialog.mcp.description": "{{enabled}} of {{total}} enabled",

@@ -1337,6 +1337,16 @@ export type ServerConfig = {
   cors?: Array<string>
 }
 
+/**
+ * Transcription backend configuration
+ */
+export type TranscriptionConfig = {
+  /**
+   * URL of a transcription endpoint that accepts audio uploads and returns JSON { text }
+   */
+  endpoint: string
+}
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -1621,6 +1631,10 @@ export type Config = {
     diff_style?: "auto" | "stacked"
   }
   server?: ServerConfig
+  /**
+   * Transcription backend configuration
+   */
+  transcription?: TranscriptionConfig
   /**
    * Command configuration, see https://opencode.ai/docs/commands
    */
