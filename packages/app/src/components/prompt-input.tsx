@@ -131,13 +131,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (!trimmed) return undefined
     return trimmed
   })
-  const transcriptionDebug = createMemo(() => {
-    if (typeof window !== "object") return false
-    const params = new URLSearchParams(window.location.search)
-    if (params.get("transcriptionDebug") === "1") return true
-    if (typeof localStorage !== "object") return false
-    return localStorage.getItem("opencode.transcription.debug") === "1"
-  })
   const layout = useLayout()
   const comments = useComments()
   const params = useParams()
@@ -379,35 +372,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const text = (data as { text?: unknown }).text
     if (typeof text !== "string") return ""
     return text.trim()
-  }
-
-  const logTranscriptionDebug = async (file: File) => {
-    if (!transcriptionDebug()) return
-    const head = new Uint8Array(await file.slice(0, 16).arrayBuffer())
-    const hex = Array.from(head)
-      .map((value) => value.toString(16).padStart(2, "0"))
-      .join(" ")
-    console.log("[transcription] file", {
-      name: file.name,
-      type: file.type,
-      size: file.size,
-      head: hex,
-    })
-
-    const target = globalThis as typeof globalThis & {
-      __opencodeTranscriptionFile?: File
-      __opencodeTranscriptionDownload?: () => void
-    }
-    target.__opencodeTranscriptionFile = file
-    target.__opencodeTranscriptionDownload = () => {
-      const url = URL.createObjectURL(file)
-      const link = document.createElement("a")
-      link.href = url
-      link.download = file.name
-      link.click()
-      URL.revokeObjectURL(url)
-    }
-    console.log("[transcription] download via window.__opencodeTranscriptionDownload()")
   }
 
   const waitForWorktree = async (input: { directory: string; sessionID: string }) => {
@@ -670,8 +634,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const form = new FormData()
     form.append("file", file)
     if (type) form.append("mime", type)
-
-    await logTranscriptionDebug(file)
 
     const response = await (platform.fetch ?? fetch)(parsed.toString(), {
       method: "POST",
