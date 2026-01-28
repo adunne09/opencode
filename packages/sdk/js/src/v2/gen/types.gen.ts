@@ -1823,6 +1823,12 @@ export type Config = {
      * Timeout in milliseconds for model context protocol (MCP) requests
      */
     mcp_timeout?: number
+    transcription?: {
+      /**
+       * HTTP endpoint used by the web client to transcribe audio
+       */
+      endpoint: string
+    }
   }
 }
 
@@ -4014,6 +4020,49 @@ export type ProviderOauthCallbackResponses = {
 }
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
+
+export type TranscriptionCreateData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/transcription"
+}
+
+export type TranscriptionCreateErrors = {
+  /**
+   * Invalid request
+   */
+  400: unknown
+  /**
+   * Payload too large
+   */
+  413: unknown
+  /**
+   * Unsupported media type
+   */
+  415: unknown
+  /**
+   * Rate limited
+   */
+  429: unknown
+  /**
+   * Transcription failed
+   */
+  500: unknown
+  /**
+   * Transcription unavailable
+   */
+  503: unknown
+}
+
+export type TranscriptionCreateResponses = {
+  /**
+   * Transcription result
+   */
+  200: unknown
+}
 
 export type FindTextData = {
   body?: never

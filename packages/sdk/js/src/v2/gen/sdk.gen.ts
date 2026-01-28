@@ -142,6 +142,8 @@ import type {
   ToolIdsResponses,
   ToolListErrors,
   ToolListResponses,
+  TranscriptionCreateErrors,
+  TranscriptionCreateResponses,
   TuiAppendPromptErrors,
   TuiAppendPromptResponses,
   TuiClearPromptResponses,
@@ -2059,6 +2061,29 @@ export class Provider extends HeyApiClient {
   }
 }
 
+export class Transcription extends HeyApiClient {
+  /**
+   * Transcribe audio
+   *
+   * Transcribe an audio file using the configured server-side engine.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "directory" }] }])
+    return (options?.client ?? this.client).post<TranscriptionCreateResponses, TranscriptionCreateErrors, ThrowOnError>(
+      {
+        url: "/transcription",
+        ...options,
+        ...params,
+      },
+    )
+  }
+}
+
 export class Find extends HeyApiClient {
   /**
    * Find text
@@ -3211,6 +3236,11 @@ export class OpencodeClient extends HeyApiClient {
   private _provider?: Provider
   get provider(): Provider {
     return (this._provider ??= new Provider({ client: this.client }))
+  }
+
+  private _transcription?: Transcription
+  get transcription(): Transcription {
+    return (this._transcription ??= new Transcription({ client: this.client }))
   }
 
   private _find?: Find

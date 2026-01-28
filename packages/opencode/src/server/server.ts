@@ -40,6 +40,7 @@ import { QuestionRoutes } from "./routes/question"
 import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
+import { TranscriptionRoutes } from "./routes/transcription"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -159,6 +160,7 @@ export namespace Server {
         .route("/permission", PermissionRoutes())
         .route("/question", QuestionRoutes())
         .route("/provider", ProviderRoutes())
+        .route("/transcription", TranscriptionRoutes())
         .route("/", FileRoutes())
         .route("/mcp", McpRoutes())
         .route("/tui", TuiRoutes())
@@ -537,9 +539,15 @@ export namespace Server {
               host: "app.opencode.ai",
             },
           })
+          const transcriptionUrl = Flag.OPENCODE_TRANSCRIPTION_URL
+          const transcriptionOrigin =
+            transcriptionUrl && (transcriptionUrl.startsWith("http://") || transcriptionUrl.startsWith("https://"))
+              ? new URL(transcriptionUrl).origin
+              : undefined
+          const connectExtra = transcriptionOrigin ? ` ${transcriptionOrigin}` : ""
           response.headers.set(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' data:",
+            `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' data:${connectExtra}`,
           )
           return response
         }) as unknown as Hono,

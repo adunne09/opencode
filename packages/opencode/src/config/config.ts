@@ -162,6 +162,14 @@ export namespace Config {
       result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
     }
 
+    if (Flag.OPENCODE_TRANSCRIPTION_URL) {
+      result.experimental = mergeDeep(result.experimental ?? {}, {
+        transcription: {
+          endpoint: Flag.OPENCODE_TRANSCRIPTION_URL,
+        },
+      })
+    }
+
     // Backwards compatibility: legacy top-level `tools` config
     if (result.tools) {
       const perms: Record<string, Config.PermissionAction> = {}
@@ -1086,6 +1094,11 @@ export namespace Config {
             .positive()
             .optional()
             .describe("Timeout in milliseconds for model context protocol (MCP) requests"),
+          transcription: z
+            .object({
+              endpoint: z.string().describe("HTTP endpoint used by the web client to transcribe audio"),
+            })
+            .optional(),
         })
         .optional(),
     })

@@ -108,6 +108,25 @@ Learn more about [agents](https://opencode.ai/docs/agents).
 
 For more info on how to configure OpenCode [**head over to our docs**](https://opencode.ai/docs).
 
+### Audio Transcription (Web)
+
+OpenCode web can transcribe audio clips when you provide a transcription endpoint. The endpoint must run on the same host that has the FluidAudio CLI installed.
+
+1. Install FluidAudio CLI on the server host (ensure `fluidaudio` is on PATH).
+2. Start the transcription server:
+
+```bash
+bun run packages/opencode/src/transcription/server.ts
+```
+
+3. Launch web with the endpoint enabled:
+
+```bash
+opencode web --transcription http://localhost:4950/transcription
+```
+
+If the CLI is missing or the endpoint is unavailable, the UI will surface an error and let you retry.
+
 ### Contributing
 
 If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.

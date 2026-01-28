@@ -58,13 +58,38 @@ import { createOpencodeClient, type Message, type Part } from "@opencode-ai/sdk/
 import { Binary } from "@opencode-ai/util/binary"
 import { showToast } from "@opencode-ai/ui/toast"
 import { base64Encode } from "@opencode-ai/util/encode"
+import { mergeTranscript } from "@/utils/transcription"
 
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
+const ACCEPTED_AUDIO_TYPES = [
+  "audio/webm",
+  "audio/ogg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+]
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 type PendingPrompt = {
   abort: AbortController
   cleanup: VoidFunction
+}
+
+type AudioAttachment = {
+  id: string
+  url: string
+  blob: Blob
+  mime: string
+  filename: string
+  durationMs?: number
+  transcript?: string
+  confidence?: number
+  status: "ready" | "recording" | "transcribing" | "error"
+  error?: string
 }
 
 const pending = new Map<string, PendingPrompt>()
@@ -134,10 +159,23 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const language = useLanguage()
   let editorRef!: HTMLDivElement
   let fileInputRef!: HTMLInputElement
+  let audioInputRef!: HTMLInputElement
   let scrollRef!: HTMLDivElement
   let slashPopoverRef!: HTMLDivElement
 
   const mirror = { input: false }
+  const transcribeAbort = { controller: undefined as AbortController | undefined }
+  const media = {
+    recorder: undefined as MediaRecorder | undefined,
+    stream: undefined as MediaStream | undefined,
+    chunks: [] as Blob[],
+    startedAt: 0,
+  }
+
+  const transcriptionEndpoint = createMemo(() => globalSync.data.config.experimental?.transcription?.endpoint)
+  const audioEnabled = createMemo(() => !!transcriptionEndpoint())
+  const [audio, setAudio] = createSignal<AudioAttachment | undefined>()
+  const [recording, setRecording] = createSignal(false)
 
   const scrollCursorIntoView = () => {
     const container = scrollRef
@@ -348,6 +386,199 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     prompt.set(next, prompt.cursor())
   }
 
+  const clearAudio = (item?: AudioAttachment) => {
+    const current = item ?? audio()
+    if (!current) return
+    URL.revokeObjectURL(current.url)
+    setAudio(undefined)
+  }
+
+  const addAudio = (blob: Blob, filename: string, durationMs?: number) => {
+    const current = audio()
+    if (current) URL.revokeObjectURL(current.url)
+    const url = URL.createObjectURL(blob)
+    const mime = blob.type || "audio/webm"
+    setAudio({
+      id: Identifier.ascending("part"),
+      url,
+      blob,
+      mime,
+      filename,
+      durationMs,
+      status: "ready",
+    })
+  }
+
+  const validateAudio = (file: File) => {
+    if (!ACCEPTED_AUDIO_TYPES.includes(file.type)) {
+      showToast({
+        title: language.t("prompt.toast.audioUnsupported.title"),
+        description: language.t("prompt.toast.audioUnsupported.description"),
+      })
+      return false
+    }
+
+    if (file.size > MAX_AUDIO_BYTES) {
+      showToast({
+        title: language.t("prompt.toast.audioTooLarge.title"),
+        description: language.t("prompt.toast.audioTooLarge.description"),
+      })
+      return false
+    }
+
+    return true
+  }
+
+  const addAudioFile = (file: File) => {
+    if (!validateAudio(file)) return
+    addAudio(file, file.name)
+  }
+
+  const startRecording = async () => {
+    if (!audioEnabled()) return
+    if (recording()) return
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      showToast({
+        title: language.t("prompt.toast.audioUnsupported.title"),
+        description: language.t("prompt.toast.audioRecordingUnsupported.description"),
+      })
+      return
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => undefined)
+    if (!stream) {
+      showToast({
+        title: language.t("prompt.toast.audioRecordingFailed.title"),
+        description: language.t("prompt.toast.audioRecordingFailed.description"),
+      })
+      return
+    }
+
+    const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((item) =>
+      MediaRecorder.isTypeSupported(item),
+    )
+    const options = type ? { mimeType: type } : undefined
+    const recorder = new MediaRecorder(stream, options)
+    media.recorder = recorder
+    media.stream = stream
+    media.chunks = []
+    media.startedAt = Date.now()
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) media.chunks.push(event.data)
+    }
+
+    recorder.onstop = () => {
+      const elapsed = Math.max(0, Date.now() - media.startedAt)
+      const blob = new Blob(media.chunks, { type: type ?? recorder.mimeType ?? "audio/webm" })
+      const name = `recording-${new Date().toISOString()}.webm`
+      stream.getTracks().forEach((track) => track.stop())
+      media.recorder = undefined
+      media.stream = undefined
+      media.chunks = []
+      setRecording(false)
+      addAudio(blob, name, elapsed)
+    }
+
+    recorder.start()
+    setRecording(true)
+  }
+
+  const stopRecording = () => {
+    const recorder = media.recorder
+    if (!recorder) return
+    if (recorder.state !== "recording") return
+    recorder.stop()
+  }
+
+  const insertTranscript = (text: string) => {
+    const current = prompt
+      .current()
+      .map((part) => ("content" in part ? part.content : ""))
+      .join("")
+    requestAnimationFrame(() => {
+      editorRef.focus()
+      setCursorPosition(editorRef, promptLength(prompt.current()))
+      addPart({ type: "text", content: mergeTranscript(current, text), start: 0, end: 0 })
+    })
+  }
+
+  const cancelTranscription = () => {
+    const controller = transcribeAbort.controller
+    if (!controller) return
+    controller.abort()
+    transcribeAbort.controller = undefined
+    setAudio((item) => (item ? { ...item, status: "ready" } : item))
+  }
+
+  const transcribeAudio = async () => {
+    const endpoint = transcriptionEndpoint()
+    if (!endpoint) return false
+    const clip = audio()
+    if (!clip) return false
+    if (clip.status === "transcribing") return false
+
+    const controller = new AbortController()
+    transcribeAbort.controller = controller
+    setAudio({ ...clip, status: "transcribing", error: undefined })
+
+    const form = new FormData()
+    form.append("file", clip.blob, clip.filename)
+
+    const request = platform.fetch ?? fetch
+    const response = await request(endpoint, {
+      method: "POST",
+      body: form,
+      signal: controller.signal,
+    }).catch(() => undefined)
+
+    if (!response) {
+      if (controller.signal.aborted) return false
+      transcribeAbort.controller = undefined
+      setAudio((item) => (item ? { ...item, status: "error", error: language.t("common.requestFailed") } : item))
+      return false
+    }
+
+    if (!response.ok) {
+      const data = (await response.json().catch(() => undefined)) as { message?: string } | undefined
+      const message = data?.message ?? ""
+      transcribeAbort.controller = undefined
+      setAudio((item) =>
+        item ? { ...item, status: "error", error: message || language.t("common.requestFailed") } : item,
+      )
+      return false
+    }
+
+    const data = (await response.json().catch(() => undefined)) as
+      | { text?: string; confidence?: number; durationMs?: number }
+      | undefined
+    const text = data?.text?.trim() ?? ""
+    if (!text) {
+      transcribeAbort.controller = undefined
+      setAudio((item) => (item ? { ...item, status: "error", error: language.t("common.requestFailed") } : item))
+      return false
+    }
+
+    setAudio((item) =>
+      item
+        ? {
+            ...item,
+            status: "ready",
+            transcript: text,
+            confidence: data?.confidence,
+            durationMs: data?.durationMs ?? item.durationMs,
+          }
+        : item,
+    )
+    transcribeAbort.controller = undefined
+    insertTranscript(text)
+    showToast({
+      title: language.t("prompt.toast.audioTranscribed.title"),
+      description: language.t("prompt.toast.audioTranscribed.description"),
+    })
+    return true
+  }
+
   const handlePaste = async (event: ClipboardEvent) => {
     if (!isFocused()) return
     const clipboardData = event.clipboardData
@@ -413,6 +644,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (ACCEPTED_FILE_TYPES.includes(file.type)) {
         await addImageAttachment(file)
       }
+      if (audioEnabled() && ACCEPTED_AUDIO_TYPES.includes(file.type)) {
+        addAudioFile(file)
+      }
     }
   }
 
@@ -425,6 +659,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     document.removeEventListener("dragover", handleGlobalDragOver)
     document.removeEventListener("dragleave", handleGlobalDragLeave)
     document.removeEventListener("drop", handleGlobalDrop)
+    const current = audio()
+    if (current) URL.revokeObjectURL(current.url)
+    if (media.recorder && media.recorder.state === "recording") media.recorder.stop()
+    if (media.stream) media.stream.getTracks().forEach((track) => track.stop())
   })
 
   createEffect(() => {
@@ -1125,9 +1363,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const text = currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
     const images = imageAttachments().slice()
     const mode = store.mode
+    const clip = audio()
+    const messageText = clip?.transcript && text.trim().length === 0 ? clip.transcript : text
 
-    if (text.trim().length === 0 && images.length === 0) {
+    if (messageText.trim().length === 0 && images.length === 0 && !clip) {
       if (working()) abort()
+      return
+    }
+
+    if (clip && !clip.transcript) {
+      const ok = await transcribeAudio()
+      if (!ok) return
       return
     }
 
@@ -1226,17 +1472,29 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
     const agent = currentAgent.name
     const variant = local.model.variant.current()
+    const audioSnapshot = clip
+
+    const detachAudio = () => {
+      setAudio(undefined)
+    }
+
+    const restoreAudio = () => {
+      if (!audioSnapshot) return
+      setAudio(audioSnapshot)
+    }
 
     const clearInput = () => {
       prompt.reset()
       setStore("mode", "normal")
       setStore("popover", null)
+      detachAudio()
     }
 
     const restoreInput = () => {
       prompt.set(currentPrompt, promptLength(currentPrompt))
       setStore("mode", mode)
       setStore("popover", null)
+      restoreAudio()
       requestAnimationFrame(() => {
         editorRef.focus()
         setCursorPosition(editorRef, promptLength(currentPrompt))
@@ -1263,8 +1521,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return
     }
 
-    if (text.startsWith("/")) {
-      const [cmdName, ...args] = text.split(" ")
+    if (messageText.startsWith("/")) {
+      const [cmdName, ...args] = messageText.split(" ")
       const commandName = cmdName.slice(1)
       const customCommand = sync.data.command.find((c) => c.name === commandName)
       if (customCommand) {
@@ -1412,10 +1670,18 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }))
 
     const messageID = Identifier.ascending("message")
+    const audioMeta = clip?.transcript
+      ? {
+          source: "audio",
+          transcriptConfidence: clip.confidence,
+          durationMs: clip.durationMs,
+        }
+      : undefined
     const textPart = {
       id: Identifier.ascending("part"),
       type: "text" as const,
-      text,
+      text: messageText,
+      metadata: audioMeta,
     }
     const requestParts = [
       textPart,
@@ -1587,29 +1853,36 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       })
     }
 
-    void send().catch((err) => {
-      pending.delete(session.id)
-      if (sessionDirectory === projectDirectory) {
-        sync.set("session_status", session.id, { type: "idle" })
-      }
-      showToast({
-        title: language.t("prompt.toast.promptSendFailed.title"),
-        description: errorMessage(err),
-      })
-      removeOptimisticMessage()
-      for (const item of commentItems) {
-        prompt.context.add({
-          type: "file",
-          path: item.path,
-          selection: item.selection,
-          comment: item.comment,
-          commentID: item.commentID,
-          commentOrigin: item.commentOrigin,
-          preview: item.preview,
+    const finalizeAudio = () => {
+      if (!audioSnapshot) return
+      clearAudio(audioSnapshot)
+    }
+
+    void send()
+      .then(finalizeAudio)
+      .catch((err) => {
+        pending.delete(session.id)
+        if (sessionDirectory === projectDirectory) {
+          sync.set("session_status", session.id, { type: "idle" })
+        }
+        showToast({
+          title: language.t("prompt.toast.promptSendFailed.title"),
+          description: errorMessage(err),
         })
-      }
-      restoreInput()
-    })
+        removeOptimisticMessage()
+        for (const item of commentItems) {
+          prompt.context.add({
+            type: "file",
+            path: item.path,
+            selection: item.selection,
+            comment: item.comment,
+            commentID: item.commentID,
+            commentOrigin: item.commentOrigin,
+            preview: item.preview,
+          })
+        }
+        restoreInput()
+      })
   }
 
   return (
@@ -1842,6 +2115,43 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             </For>
           </div>
         </Show>
+        <Show when={audio()}>
+          {(item) => (
+            <div class="flex items-center gap-2 px-3 pt-3">
+              <div class="flex items-center gap-2 px-2 py-1 rounded-md bg-surface-base border border-border-base">
+                <audio controls src={item().url} class="h-6" />
+                <Show when={item().status === "transcribing"}>
+                  <span class="text-12-regular text-text-weak">{language.t("prompt.audio.transcribing")}</span>
+                  <Button size="small" variant="ghost" onClick={cancelTranscription}>
+                    {language.t("prompt.audio.cancel")}
+                  </Button>
+                </Show>
+                <Show when={item().status === "error"}>
+                  <span class="text-12-regular text-text-weak">{item().error}</span>
+                  <Button size="small" variant="ghost" onClick={transcribeAudio}>
+                    {language.t("prompt.audio.retry")}
+                  </Button>
+                </Show>
+                <Show when={item().status === "ready" && !item().transcript}>
+                  <Button size="small" variant="ghost" onClick={transcribeAudio}>
+                    {language.t("prompt.audio.transcribe")}
+                  </Button>
+                </Show>
+                <Show when={item().status === "ready" && item().transcript}>
+                  <span class="text-12-regular text-text-weak">{language.t("prompt.audio.ready")}</span>
+                </Show>
+              </div>
+              <IconButton
+                type="button"
+                icon="close"
+                variant="ghost"
+                class="h-6 w-6"
+                onClick={() => clearAudio(item())}
+                aria-label={language.t("prompt.audio.remove")}
+              />
+            </div>
+          )}
+        </Show>
         <div class="relative max-h-[240px] overflow-y-auto" ref={(el) => (scrollRef = el)}>
           <div
             data-component="prompt-input"
@@ -2001,6 +2311,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 e.currentTarget.value = ""
               }}
             />
+            <input
+              ref={audioInputRef}
+              type="file"
+              accept={ACCEPTED_AUDIO_TYPES.join(",")}
+              class="hidden"
+              onChange={(e) => {
+                const file = e.currentTarget.files?.[0]
+                if (file) addAudioFile(file)
+                e.currentTarget.value = ""
+              }}
+            />
             <div class="flex items-center gap-2">
               <SessionContextUsage />
               <Show when={store.mode === "normal"}>
@@ -2016,10 +2337,41 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   </Button>
                 </Tooltip>
               </Show>
+              <Show when={store.mode === "normal" && audioEnabled()}>
+                <Tooltip placement="top" value={language.t("prompt.action.attachAudio")}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    class="size-6"
+                    onClick={() => audioInputRef.click()}
+                    aria-label={language.t("prompt.action.attachAudio")}
+                  >
+                    <Icon name="speech-bubble" class="size-4.5" />
+                  </Button>
+                </Tooltip>
+                <Tooltip
+                  placement="top"
+                  value={
+                    recording() ? language.t("prompt.action.stopRecording") : language.t("prompt.action.recordAudio")
+                  }
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    class="size-6"
+                    onClick={() => (recording() ? stopRecording() : startRecording())}
+                    aria-label={
+                      recording() ? language.t("prompt.action.stopRecording") : language.t("prompt.action.recordAudio")
+                    }
+                  >
+                    <Icon name={recording() ? "stop" : "bubble-5"} class="size-4.5" />
+                  </Button>
+                </Tooltip>
+              </Show>
             </div>
             <Tooltip
               placement="top"
-              inactive={!prompt.dirty() && !working()}
+              inactive={!prompt.dirty() && !working() && !audio()}
               value={
                 <Switch>
                   <Match when={working()}>
@@ -2039,7 +2391,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             >
               <IconButton
                 type="submit"
-                disabled={!prompt.dirty() && !working()}
+                disabled={!prompt.dirty() && !working() && !audio()}
                 icon={working() ? "stop" : "arrow-up"}
                 variant="primary"
                 class="h-6 w-4.5"
